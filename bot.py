@@ -512,8 +512,27 @@ async def accounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is running successfully on Render.")
+
+def start_dummy_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), DummyHandler)
+    server.serve_forever()
+
 def main():
     logger.info("Starting TG Member Bot v1.0...")
+
+    # Start dummy web server so Render doesn't timeout the "Web Service" Deploy
+    threading.Thread(target=start_dummy_server, daemon=True).start()
+    logger.info("Started dummy web server for Render health checks.")
 
     app = Application.builder().token(BOT_TOKEN).build()
 

@@ -133,8 +133,23 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("👥 سحب جميع الأعضاء (للمجموعات المفتوحة)", callback_data="scrape_all")],
+            [InlineKeyboardButton("💬 سحب المتفاعلين (للمجموعات المخفية)", callback_data="scrape_active")],
+            [InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")]
+        ])
+
         await query.edit_message_text(
-            "🔍 **سحب الأعضاء**\n\n"
+            "🔍 **سحب الأعضاء**\n\nاختر نوع السحب:",
+            reply_markup=kb,
+            parse_mode="Markdown",
+        )
+
+    elif data in ["scrape_all", "scrape_active"]:
+        context.user_data["scrape_type"] = data
+        kind = "المتفاعلين من الدردشة" if data == "scrape_active" else "جميع الأعضاء"
+        await query.edit_message_text(
+            f"🔍 **سحب {kind}**\n\n"
             "أرسل رابط أو يوزرنيم المجموعة المصدر\n"
             "مثال: `@groupname` أو `https://t.me/groupname`",
             reply_markup=back_keyboard(),
@@ -414,11 +429,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-        members, result = await engine.scrape_members(phone, source, progress)
+        scrape_type = context.user_data.get("scrape_type")
+        if scrape_type == "scrape_active":
+            members, result = await engine.scrape_active_members(phone, source, progress_callback=progress)
+        else:
+            members, result = await engine.scrape_members(phone, source, progress_callback=progress)
 
         final_text = result
         if members:
-            final_text += f"\n\n📊 عدد الأعضاء: {len(members)}"
+            final_text += f"\n\n📊 عدد الأعضاء المحفوظين: {len(members)}"
 
         await status_msg.edit_text(final_text, reply_markup=back_keyboard())
 

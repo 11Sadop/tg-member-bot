@@ -151,6 +151,69 @@ async def scrape_members(phone, source_group, progress_callback=None):
     return all_members, f"✅ تم سحب {len(all_members)} عضو من {title}"
 
 
+async def scrape_active_members(phone, source_group, message_limit=5000, progress_callback=None):
+    """
+    Scrape members from a group's chat history by collecting users who sent messages.
+    Useful for groups with hidden members list.
+    """
+    client = get_client(phone)
+    await client.connect()
+
+    if not await client.is_user_authorized():
+        await client.disconnect()
+        return None, "غير مسجل الدخول"
+
+    try:
+        entity = await client.get_entity(source_group)
+    except Exception as e:
+        await client.disconnect()
+        return None, f"ما لقيت القروب: {e}"
+
+    title = getattr(entity, 'title', source_group)
+    if progress_callback:
+        await progress_callback(f"🔍 جاري سحب المتفاعلين من دردشة: {title}")
+
+    all_members = {}  # Using dict to deduplicate by user_id
+    count = 0
+
+    try:
+        # iter_messages is the standard telethon way to fetch history
+        async for message in client.iter_messages(entity, limit=message_limit):
+            user = message.sender
+            if user and isinstance(user, User) and not user.bot and not user.deleted:
+                if user.id not in all_members:
+                    all_members[user.id] = {
+                        "id": user.id,
+                        "access_hash": str(user.access_hash) if user.access_hash else "0",
+                        "username": user.username or "",
+                        "first_name": user.first_name or "",
+                        "last_name": user.last_name or "",
+                    }
+            
+            count += 1
+            if progress_callback and count % 500 == 0:
+                await progress_callback(f"📥 فحصنا {count} رسالة... لقينا {len(all_members)} عضو متفاعل.")
+                await asyncio.sleep(1) # prevent flood
+
+    except FloodWaitError as e:
+        if progress_callback:
+            await progress_callback(f"⏳ فلود! انتظار {e.seconds} ثانية...")
+        await asyncio.sleep(e.seconds + 2)
+    except Exception as e:
+        if progress_callback:
+             await progress_callback(f"⚠️ خطأ أثناء السحب: {str(e)[:50]}")
+
+    await client.disconnect()
+
+    result_list = list(all_members.values())
+    
+    # Save to database
+    db.save_members(result_list)
+
+    return result_list, f"✅ تم سحب {len(result_list)} عضو متفاعل من {title}"
+
+
+
 # ═══════════════════════════════════════════
 # Invitation Engine
 # ═══════════════════════════════════════════

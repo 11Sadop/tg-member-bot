@@ -510,6 +510,17 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot is running!")
+
+    # Python 3.10+ compatibility: ensure event loop exists
+    import sys
+    if sys.version_info >= (3, 10):
+        import asyncio
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
     app.run_polling(drop_pending_updates=True)
 
 

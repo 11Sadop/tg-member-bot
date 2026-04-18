@@ -217,10 +217,148 @@ async def scrape_active_members(phone, source_group, message_limit=5000, progres
 # ═══════════════════════════════════════════
 # Invitation Engine
 # ═══════════════════════════════════════════
+
+async def _invite_worker(phone, phone_idx, target_group, members_chunk, shared_state, stop_check, progress_queue):
+    """Worker task for a single phone number"""
+    if not members_chunk:
+        return 0, 0
+    
+    added = 0
+    failed = 0
+    client = get_client(phone)
+
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            progress_queue.append(f"⚠️ {phone} غير مسجل.. تخطي")
+            return 0, len(members_chunk)
+
+        try:
+            await client(JoinChannelRequest(target_group))
+        except Exception:
+            pass
+
+        try:
+            target_entity = await asyncio.wait_for(client.get_entity(target_group), timeout=15.0)
+        except Exception as e:
+            progress_queue.append(f"❌ {phone}: ما لقى القروب - {str(e)[:30]}")
+            await client.disconnect()
+            return 0, len(members_chunk)
+
+        is_channel = getattr(target_entity, 'broadcast', False)
+        
+        try:
+            await client.get_messages(target_entity, limit=3)
+            await asyncio.sleep(random.uniform(2, 5))
+        except Exception:
+            pass
+
+        consecutive_privacy = 0
+
+        for member in members_chunk:
+            if stop_check and stop_check():
+                break
+
+            username = member.get("username", "")
+            user_id = member.get("id")
+            access_hash = member.get("access_hash", "0")
+            display = f"@{username}" if username else f"ID:{user_id}"
+
+            # Resolve user entity
+            user_entity = None
+            if username and username != "None":
+                try:
+                    user_entity = await asyncio.wait_for(client.get_entity(username), timeout=5.0)
+                except Exception:
+                    pass
+
+            if not user_entity and user_id and str(user_id).isdigit():
+                try:
+                    uhash = int(access_hash or 0)
+                    if uhash != 0:
+                        user_entity = InputPeerUser(int(user_id), uhash)
+                    else:
+                        try:
+                            user_entity = await asyncio.wait_for(client.get_entity(int(user_id)), timeout=5.0)
+                        except Exception:
+                            pass
+                except (ValueError, TypeError):
+                    pass
+
+            if not user_entity:
+                failed += 1
+                shared_state['failed'] += 1
+                continue
+
+            # Contact Injection
+            try:
+                await client(ImportContactsRequest([
+                    InputPhoneContact(
+                        client_id=random.randint(0, 999999),
+                        phone="", first_name=display, last_name=""
+                    )
+                ]))
+            except Exception:
+                pass
+
+            # Attempt invitation
+            try:
+                await asyncio.wait_for(
+                    client(InviteToChannelRequest(target_entity, [user_entity])),
+                    timeout=30.0
+                )
+
+                added += 1
+                shared_state['added'] += 1
+                consecutive_privacy = 0
+
+                uid = str(getattr(user_entity, 'user_id', getattr(user_entity, 'id', user_id)))
+                db.mark_added(uid)
+
+                # Smart delay (Reduced for speed!)
+                if added < MAX_PER_ACCOUNT:
+                    delay = random.uniform(15, 30)
+                    await asyncio.sleep(delay)
+
+            except (UserPrivacyRestrictedError, UserNotMutualContactError):
+                failed += 1
+                shared_state['failed'] += 1
+                consecutive_privacy += 1
+                uid = str(user_id or "")
+                if uid:
+                    db.mark_added(uid)
+
+                if consecutive_privacy >= 10:
+                    break
+
+            except FloodWaitError as e:
+                db.set_flood(phone, e.seconds)
+                break
+
+            except (PeerFloodError, ChatWriteForbiddenError, UserBannedInChannelError):
+                break
+
+            except Exception as e:
+                failed += 1
+                shared_state['failed'] += 1
+                if "AuthKey" in type(e).__name__ or "Unauthorized" in type(e).__name__:
+                    break
+
+        await client.disconnect()
+
+    except Exception:
+        try:
+            await client.disconnect()
+        except:
+            pass
+
+    return added, failed
+
+
 async def invite_members(target_group, progress_callback=None, stop_check=None):
     """
-    Invite scraped members to target group.
-    Uses all registered accounts with rotation.
+    Invite scraped members to target group concurrently.
+    Uses all registered accounts AT THE SAME TIME.
     40 members per account.
     """
     members = db.get_members()
@@ -244,11 +382,9 @@ async def invite_members(target_group, progress_callback=None, stop_check=None):
         return 0, 0
 
     members = filtered
-    total = len(members)
 
     # Get available accounts
     phones = db.get_accounts()
-    # Filter out flooded accounts
     phones = [p for p in phones if not db.is_flooded(p)]
 
     if not phones:
@@ -256,218 +392,92 @@ async def invite_members(target_group, progress_callback=None, stop_check=None):
             await progress_callback("❌ لا يوجد حسابات جاهزة! كلها محظورة أو غير مسجلة.")
         return 0, 0
 
-    if progress_callback:
-        await progress_callback(
-            f"🚀 بدء الإضافة\n"
-            f"👥 الأعضاء: {total}\n"
-            f"📱 الحسابات: {len(phones)}\n"
-            f"📊 الحد: {MAX_PER_ACCOUNT} لكل رقم"
+    # Distribute members across available phones (MAX_PER_ACCOUNT per phone)
+    tasks = []
+    shared_state = {'added': 0, 'failed': 0}
+    progress_queue = []
+    
+    # Slice the members
+    members_to_take = min(len(members), len(phones) * MAX_PER_ACCOUNT)
+    members = members[:members_to_take]
+    total_assigned = len(members)
+
+    chunk_idx = 0
+    for phone_idx, phone in enumerate(phones):
+        if chunk_idx >= len(members):
+            break
+        # Take up to MAX_PER_ACCOUNT
+        chunk = members[chunk_idx : chunk_idx + MAX_PER_ACCOUNT]
+        chunk_idx += len(chunk)
+        
+        # Start worker task
+        tasks.append(
+            asyncio.create_task(_invite_worker(phone, phone_idx, target_group, chunk, shared_state, stop_check, progress_queue))
         )
 
-    added = 0
-    failed = 0
-    i = 0
+    active_phones_count = len(tasks)
 
-    for phone_idx, phone in enumerate(phones):
-        if i >= total:
-            break
+    if progress_callback:
+        await progress_callback(
+            f"🚀 بدء الإضافة (بشكل متزامن ⚡)\n"
+            f"👥 الأعضاء المخصصين: {total_assigned}\n"
+            f"📱 الحسابات الفعالة: {active_phones_count}\n"
+            f"⏳ جارِ تشغيل جميع الحسابات في نفس الوقت..."
+        )
 
-        if stop_check and stop_check():
-            break
-
-        client = get_client(phone)
-        try:
-            await client.connect()
-            if not await client.is_user_authorized():
+    # Reporter loop runs while tasks are active
+    async def reporter():
+        last_added = -1
+        last_failed = -1
+        while not all(t.done() for t in tasks):
+            if stop_check and stop_check():
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                break
+                
+            cur_added = shared_state['added']
+            cur_failed = shared_state['failed']
+            
+            # Update only if values changed
+            if cur_added != last_added or cur_failed != last_failed or progress_queue:
+                msg = f"⚡ جاري الإضافة المتزامنة ({active_phones_count} حساب)...\n\n"
+                msg += f"✅ نجح: {cur_added}\n"
+                msg += f"❌ فشل: {cur_failed}\n"
+                msg += f"📊 باقي بالدفعة: {total_assigned - (cur_added + cur_failed)}"
+                
+                # consume some alerts if present
+                if progress_queue:
+                    alerts = progress_queue[-2:] # show last two
+                    progress_queue.clear()
+                    msg += "\n\n🔔 آخر التنبيهات:\n" + "\n".join(alerts)
+                
                 if progress_callback:
-                    await progress_callback(f"⚠️ {phone} غير مسجل.. تخطي")
-                continue
-
-            # Join target group
-            try:
-                await client(JoinChannelRequest(target_group))
-            except Exception:
-                pass
-
-            # Get target entity
-            try:
-                target_entity = await asyncio.wait_for(
-                    client.get_entity(target_group), timeout=15.0
-                )
-            except Exception as e:
-                if progress_callback:
-                    await progress_callback(f"❌ {phone}: ما لقى القروب - {str(e)[:30]}")
-                await client.disconnect()
-                continue
-
-            is_channel = getattr(target_entity, 'broadcast', False)
-            title = getattr(target_entity, 'title', target_group)
-
-            if progress_callback:
-                kind = "القناة" if is_channel else "المجموعة"
-                await progress_callback(
-                    f"📱 الحساب: {phone} ({phone_idx+1}/{len(phones)})\n"
-                    f"🎯 {kind}: {title}"
-                )
-
-            # Warm-up
-            try:
-                await client.get_messages(target_entity, limit=3)
-                await asyncio.sleep(random.uniform(2, 5))
-            except Exception:
-                pass
-
-            account_added = 0
-            consecutive_privacy = 0
-
-            while i < total and account_added < MAX_PER_ACCOUNT:
-                if stop_check and stop_check():
-                    break
-
-                member = members[i]
-                username = member.get("username", "")
-                user_id = member.get("id")
-                access_hash = member.get("access_hash", "0")
-                display = f"@{username}" if username else f"ID:{user_id}"
-
-                # Resolve user entity
-                user_entity = None
-                if username and username != "None":
                     try:
-                        user_entity = await asyncio.wait_for(
-                            client.get_entity(username), timeout=5.0
-                        )
-                    except Exception:
-                        pass
+                        await progress_callback(msg)
+                    except: pass
+                
+                last_added = cur_added
+                last_failed = cur_failed
+            
+            await asyncio.sleep(4)
 
-                if not user_entity and user_id and str(user_id).isdigit():
-                    try:
-                        uhash = int(access_hash or 0)
-                        if uhash != 0:
-                            user_entity = InputPeerUser(int(user_id), uhash)
-                        else:
-                            try:
-                                user_entity = await asyncio.wait_for(
-                                    client.get_entity(int(user_id)), timeout=5.0
-                                )
-                            except Exception:
-                                pass
-                    except (ValueError, TypeError):
-                        pass
+    reporter_task = asyncio.create_task(reporter())
+    
+    # Wait for all workers to finish
+    await asyncio.gather(*tasks, return_exceptions=True)
+    await reporter_task
 
-                if not user_entity:
-                    failed += 1
-                    i += 1
-                    continue
-
-                # Contact Injection
-                try:
-                    await client(ImportContactsRequest([
-                        InputPhoneContact(
-                            client_id=random.randint(0, 999999),
-                            phone="", first_name=display, last_name=""
-                        )
-                    ]))
-                except Exception:
-                    pass
-
-                # Attempt invitation
-                try:
-                    if is_channel:
-                        await asyncio.wait_for(
-                            client(InviteToChannelRequest(target_entity, [user_entity])),
-                            timeout=30.0
-                        )
-                    else:
-                        await asyncio.wait_for(
-                            client(InviteToChannelRequest(target_entity, [user_entity])),
-                            timeout=30.0
-                        )
-
-                    added += 1
-                    account_added += 1
-                    consecutive_privacy = 0
-
-                    uid = str(getattr(user_entity, 'user_id', getattr(user_entity, 'id', user_id)))
-                    db.mark_added(uid)
-
-                    if progress_callback and added % 2 == 0:
-                        await progress_callback(
-                            f"📱 {phone} | ✅ {display}\n"
-                            f"📊 نجح: {added} | فشل: {failed} | باقي: {total-i-1}\n"
-                            f"📈 هذا الحساب: {account_added}/{MAX_PER_ACCOUNT}"
-                        )
-
-                    i += 1
-
-                    # Smart delay
-                    if account_added < MAX_PER_ACCOUNT and i < total:
-                        delay = random.uniform(35, 75)
-                        if progress_callback and account_added % 5 == 0:
-                            await progress_callback(f"⏳ انتظار {delay:.0f} ثانية...")
-                        await asyncio.sleep(delay)
-
-                except (UserPrivacyRestrictedError, UserNotMutualContactError):
-                    failed += 1
-                    consecutive_privacy += 1
-                    uid = str(user_id or "")
-                    if uid:
-                        db.mark_added(uid)
-                    i += 1
-
-                    if consecutive_privacy >= 10:
-                        if progress_callback:
-                            await progress_callback(
-                                f"⚠️ {phone}: 10 خصوصية متتالية.. تدوير"
-                            )
-                        break
-
-                except FloodWaitError as e:
-                    db.set_flood(phone, e.seconds)
-                    if progress_callback:
-                        h = e.seconds // 3600
-                        m = (e.seconds % 3600) // 60
-                        await progress_callback(
-                            f"🚫 {phone}: فلود {h}س {m}د.. تدوير للحساب التالي"
-                        )
-                    break
-
-                except (PeerFloodError, ChatWriteForbiddenError, UserBannedInChannelError):
-                    if progress_callback:
-                        await progress_callback(f"🚫 {phone}: مقيّد.. تدوير")
-                    break
-
-                except Exception as e:
-                    failed += 1
-                    i += 1
-                    err = str(e)[:40]
-                    if "AuthKey" in type(e).__name__ or "Unauthorized" in type(e).__name__:
-                        if progress_callback:
-                            await progress_callback(f"🔒 {phone}: جلسة منتهية.. تدوير")
-                        break
-
-            if progress_callback:
-                await progress_callback(
-                    f"✅ {phone} انتهى: أضاف {account_added} عضو"
-                )
-
-            await client.disconnect()
-
-        except Exception as e:
-            if progress_callback:
-                await progress_callback(f"❌ خطأ {phone}: {str(e)[:40]}")
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
+    total_added = shared_state['added']
+    total_failed = shared_state['failed']
 
     # Final report
     if progress_callback:
         await progress_callback(
-            f"🏁 انتهت العملية!\n\n"
-            f"✅ نجح: {added}\n"
-            f"❌ فشل: {failed}\n"
-            f"📱 حسابات مستخدمة: {min(phone_idx+1, len(phones))}"
+            f"🏁 انتهت العملية المتزامنة!\n\n"
+            f"✅ المجموع الناجح: {total_added}\n"
+            f"❌ المجموع الفاشل: {total_failed}\n"
+            f"📱 الحسابات التي اشتغلت: {active_phones_count}"
         )
 
-    return added, failed
+    return total_added, total_failed

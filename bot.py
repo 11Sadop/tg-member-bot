@@ -20,6 +20,8 @@ from telegram.ext import (
     MessageHandler, ConversationHandler, filters, ContextTypes
 )
 
+from telethon.errors import SessionPasswordNeededError
+
 import database as db
 import engine
 

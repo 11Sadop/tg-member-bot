@@ -218,11 +218,8 @@ async def scrape_active_members(phone, source_group, message_limit=5000, progres
 # Invitation Engine
 # ═══════════════════════════════════════════
 
-async def _invite_worker(phone, phone_idx, target_group, members_chunk, shared_state, stop_check, progress_queue):
-    """Worker task for a single phone number"""
-    if not members_chunk:
-        return 0, 0
-    
+async def _invite_worker(phone, phone_idx, target_group, queue, shared_state, stop_check, progress_queue):
+    """Worker task for a single phone number reading from a shared queue."""
     added = 0
     failed = 0
     client = get_client(phone)
@@ -230,9 +227,10 @@ async def _invite_worker(phone, phone_idx, target_group, members_chunk, shared_s
     try:
         await client.connect()
         if not await client.is_user_authorized():
-            progress_queue.append(f"⚠️ {phone} غير مسجل.. تخطي")
-            return 0, len(members_chunk)
+            progress_queue.append(f"⚠️ {phone} غير مسجل.. تم تخطيه.")
+            return 0, 0
 
+        # Try to join the group
         try:
             await client(JoinChannelRequest(target_group))
         except Exception:
@@ -241,9 +239,9 @@ async def _invite_worker(phone, phone_idx, target_group, members_chunk, shared_s
         try:
             target_entity = await asyncio.wait_for(client.get_entity(target_group), timeout=15.0)
         except Exception as e:
-            progress_queue.append(f"❌ {phone}: ما لقى القروب - {str(e)[:30]}")
+            progress_queue.append(f"❌ {phone}: فشل جلب بيانات المجموعة - تأكد من الرابط.")
             await client.disconnect()
-            return 0, len(members_chunk)
+            return 0, 0
 
         is_channel = getattr(target_entity, 'broadcast', False)
         
@@ -255,9 +253,14 @@ async def _invite_worker(phone, phone_idx, target_group, members_chunk, shared_s
 
         consecutive_privacy = 0
 
-        for member in members_chunk:
+        while added < MAX_PER_ACCOUNT:
             if stop_check and stop_check():
                 break
+
+            try:
+                member_idx, member = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break # No more members to process
 
             username = member.get("username", "")
             user_id = member.get("id")
@@ -288,6 +291,9 @@ async def _invite_worker(phone, phone_idx, target_group, members_chunk, shared_s
             if not user_entity:
                 failed += 1
                 shared_state['failed'] += 1
+                queue.task_done()
+                # Optional small delay
+                await asyncio.sleep(1)
                 continue
 
             # Contact Injection
@@ -314,8 +320,9 @@ async def _invite_worker(phone, phone_idx, target_group, members_chunk, shared_s
 
                 uid = str(getattr(user_entity, 'user_id', getattr(user_entity, 'id', user_id)))
                 db.mark_added(uid)
+                queue.task_done()
 
-                # Smart delay (Reduced for speed!)
+                # Smart delay on success to prevent ban
                 if added < MAX_PER_ACCOUNT:
                     delay = random.uniform(15, 30)
                     await asyncio.sleep(delay)
@@ -327,26 +334,49 @@ async def _invite_worker(phone, phone_idx, target_group, members_chunk, shared_s
                 uid = str(user_id or "")
                 if uid:
                     db.mark_added(uid)
+                queue.task_done()
+
+                # Small delay on failure to avoid bot flagging
+                await asyncio.sleep(random.uniform(2, 5))
 
                 if consecutive_privacy >= 10:
+                    progress_queue.append(f"⚠️ {phone}: خصوصية متتالية كثيرة.. سيتم إيقاف هذا الحساب مؤقتاً.")
                     break
 
             except FloodWaitError as e:
                 db.set_flood(phone, e.seconds)
+                queue.put_nowait((member_idx, member)) # Put member back!
+                progress_queue.append(f"🚫 {phone}: انحظر مؤقتاً (فلود الطير).")
                 break
 
-            except (PeerFloodError, ChatWriteForbiddenError, UserBannedInChannelError):
+            except (PeerFloodError, ChatWriteForbiddenError, UserBannedInChannelError) as e:
+                queue.put_nowait((member_idx, member)) # Put member back!
+                if isinstance(e, ChatWriteForbiddenError):
+                    progress_queue.append(f"❌ {phone}: ليس لديه صلاحية للإضافة في هذه المجموعة.")
+                else:
+                    progress_queue.append(f"🚫 {phone}: وصل حد الإزعاج المستمر (حظر سبام).")
                 break
 
             except Exception as e:
                 failed += 1
                 shared_state['failed'] += 1
+                queue.task_done()
+                
+                err_msg = str(e)
+                if "already a participant" in err_msg.lower():
+                    # Count as success visually or ignore, but it's not a real failure logically
+                    pass
+                
                 if "AuthKey" in type(e).__name__ or "Unauthorized" in type(e).__name__:
+                    progress_queue.append(f"🔒 {phone}: انتهت الجلسة (تم تسجيل خروجه).")
                     break
+                
+                await asyncio.sleep(random.uniform(1, 3))
 
         await client.disconnect()
 
-    except Exception:
+    except Exception as e:
+        progress_queue.append(f"⚠️ {phone}: تعطل مفاجئ - {str(e)[:40]}")
         try:
             await client.disconnect()
         except:
@@ -357,9 +387,7 @@ async def _invite_worker(phone, phone_idx, target_group, members_chunk, shared_s
 
 async def invite_members(target_group, progress_callback=None, stop_check=None):
     """
-    Invite scraped members to target group concurrently.
-    Uses all registered accounts AT THE SAME TIME.
-    40 members per account.
+    Invite scraped members to target group concurrently using an asyncio Queue.
     """
     members = db.get_members()
     if not members:
@@ -392,27 +420,24 @@ async def invite_members(target_group, progress_callback=None, stop_check=None):
             await progress_callback("❌ لا يوجد حسابات جاهزة! كلها محظورة أو غير مسجلة.")
         return 0, 0
 
-    # Distribute members across available phones (MAX_PER_ACCOUNT per phone)
+    # Cap maximum allowed total by number of unbanned accounts * 40 limit
+    max_total_allowed = len(phones) * MAX_PER_ACCOUNT
+    members_to_take = min(len(members), max_total_allowed)
+    members_chunk = members[:members_to_take]
+    total_assigned = len(members_chunk)
+
+    # Initialize shared queue
+    queue = asyncio.Queue()
+    for idx, member in enumerate(members_chunk):
+        queue.put_nowait((idx, member))
+
     tasks = []
     shared_state = {'added': 0, 'failed': 0}
     progress_queue = []
-    
-    # Slice the members
-    members_to_take = min(len(members), len(phones) * MAX_PER_ACCOUNT)
-    members = members[:members_to_take]
-    total_assigned = len(members)
 
-    chunk_idx = 0
     for phone_idx, phone in enumerate(phones):
-        if chunk_idx >= len(members):
-            break
-        # Take up to MAX_PER_ACCOUNT
-        chunk = members[chunk_idx : chunk_idx + MAX_PER_ACCOUNT]
-        chunk_idx += len(chunk)
-        
-        # Start worker task
         tasks.append(
-            asyncio.create_task(_invite_worker(phone, phone_idx, target_group, chunk, shared_state, stop_check, progress_queue))
+            asyncio.create_task(_invite_worker(phone, phone_idx, target_group, queue, shared_state, stop_check, progress_queue))
         )
 
     active_phones_count = len(tasks)
@@ -422,7 +447,7 @@ async def invite_members(target_group, progress_callback=None, stop_check=None):
             f"🚀 بدء الإضافة (بشكل متزامن ⚡)\n"
             f"👥 الأعضاء المخصصين: {total_assigned}\n"
             f"📱 الحسابات الفعالة: {active_phones_count}\n"
-            f"⏳ جارِ تشغيل جميع الحسابات في نفس الوقت..."
+            f"⏳ جارِ تشغيل العمليات والموازنة التلقائية..."
         )
 
     # Reporter loop runs while tasks are active
@@ -441,16 +466,19 @@ async def invite_members(target_group, progress_callback=None, stop_check=None):
             
             # Update only if values changed
             if cur_added != last_added or cur_failed != last_failed or progress_queue:
+                qsize = queue.qsize()
+                
                 msg = f"⚡ جاري الإضافة المتزامنة ({active_phones_count} حساب)...\n\n"
                 msg += f"✅ نجح: {cur_added}\n"
-                msg += f"❌ فشل: {cur_failed}\n"
-                msg += f"📊 باقي بالدفعة: {total_assigned - (cur_added + cur_failed)}"
+                msg += f"❌ فشل أو مقيد: {cur_failed}\n"
+                msg += f"📊 متبقي في الطابور: {qsize}"
                 
                 # consume some alerts if present
                 if progress_queue:
-                    alerts = progress_queue[-2:] # show last two
+                    # Collect all recent alerts up to 4
+                    alerts = progress_queue[-4:] 
                     progress_queue.clear()
-                    msg += "\n\n🔔 آخر التنبيهات:\n" + "\n".join(alerts)
+                    msg += "\n\n🔔 تنبيهات النظام:\n" + "\n".join(alerts)
                 
                 if progress_callback:
                     try:
@@ -473,11 +501,17 @@ async def invite_members(target_group, progress_callback=None, stop_check=None):
 
     # Final report
     if progress_callback:
-        await progress_callback(
+        final_msg = (
             f"🏁 انتهت العملية المتزامنة!\n\n"
             f"✅ المجموع الناجح: {total_added}\n"
             f"❌ المجموع الفاشل: {total_failed}\n"
-            f"📱 الحسابات التي اشتغلت: {active_phones_count}"
+            f"📱 الحسابات التي شاركت: {active_phones_count}"
         )
+        # Notify about remaining queue elements
+        leftover = queue.qsize()
+        if leftover > 0:
+            final_msg += f"\n\n⚠️ يوجد {leftover} عضو لم يتم تجربتهم بسبب توقف جميع الحسابات أوتوماتيكياً (حظر أو تقييد سبام)."
+            
+        await progress_callback(final_msg)
 
     return total_added, total_failed

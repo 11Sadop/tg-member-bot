@@ -399,8 +399,8 @@ async def _invite_worker(phone, phone_idx, target_group, queue, shared_state, st
                 # Delay on failure to avoid bot flagging
                 await asyncio.sleep(random.uniform(8, 15))
 
-                if consecutive_privacy >= 10:
-                    progress_queue.append(f"⚠️ {phone}: فشل متتالي لـ 10 أعضاء.. سيتم إيقاف الحساب للحماية.")
+                if consecutive_privacy >= 25:
+                    progress_queue.append(f"⚠️ {phone}: فشل متتالي لـ 25 عضو.. سيتم إيقاف الحساب للحماية.")
                     break
 
         await client.disconnect()
@@ -450,10 +450,10 @@ async def invite_members(target_group, progress_callback=None, stop_check=None):
             await progress_callback("❌ لا يوجد حسابات جاهزة! كلها محظورة أو غير مسجلة.")
         return 0, 0
 
-    # Cap maximum allowed total by number of unbanned accounts * 40 limit
-    max_total_allowed = len(phones) * MAX_PER_ACCOUNT
-    members_to_take = min(len(members), max_total_allowed)
-    members_chunk = members[:members_to_take]
+    # Do not limit to exactly MAX_PER_ACCOUNT per phone in the queue.
+    # Put ALL members in the queue, so workers can keep trying if some fail,
+    # until each account reaches exactly MAX_PER_ACCOUNT successful adds.
+    members_chunk = members
     total_assigned = len(members_chunk)
 
     # Initialize shared queue

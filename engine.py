@@ -348,8 +348,11 @@ async def _invite_worker(phone, phone_idx, target_group, queue, shared_state, st
                 err_msg = str(e).lower()
                 if "already a participant" in err_msg or "user_already_participant" in err_msg:
                     invite_success = True
-                
-                if "authkey" in err_msg or "unauthorized" in err_msg:
+                elif "chatadminrequired" in err_msg:
+                    queue.put_nowait((member_idx, member))
+                    progress_queue.append(f"❌ {phone}: لا يمكن الإضافة! تحتاج أن تكون مشرفاً (Admin) في هذه القناة.")
+                    break
+                elif "authkey" in err_msg or "unauthorized" in err_msg:
                     queue.put_nowait((member_idx, member))
                     progress_queue.append(f"🔒 {phone}: انتهت الجلسة (تم تسجيل خروجه).")
                     break

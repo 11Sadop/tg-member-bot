@@ -321,10 +321,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await status_msg.edit_text(
                 f"📨 تم إرسال كود التحقق إلى {phone}\n\n"
-                f"أرسل الكود هنا (5 أرقام):",
+                f"⚠️ **تنبيه أمني هام جداً:**\n"
+                f"تيليجرام يحظر تسجيل الدخول إذا أرسلت الكود بشكل مباشر.\n"
+                f"يرجى إرسال الكود **مفصولاً بمسافات**.\n"
+                f"مثال: إذا كان الكود `12345`، أرسله هكذا:\n"
+                f"`1 2 3 4 5`",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("❌ إلغاء", callback_data="main_menu")]
                 ]),
+                parse_mode="Markdown",
             )
         except Exception as e:
             await status_msg.edit_text(
@@ -334,13 +339,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["state"] = None
 
     elif state == STATE_CODE:
-        code = text.strip()
+        code = text.replace(" ", "").replace("-", "").strip()
         phone = context.user_data.get("reg_phone", "")
         client = context.user_data.get("reg_client")
 
         if not client:
             await update.message.reply_text("❌ خطأ! أعد التسجيل.", reply_markup=back_keyboard())
             context.user_data["state"] = None
+            return
+        
+        if not code.isdigit():
+            await update.message.reply_text("❌ الكود يجب أن يكون أرقاماً فقط (يُسمح بالمسافات). أرسله مرة أخرى.", reply_markup=back_keyboard())
             return
 
         status_msg = await update.message.reply_text("🔐 جاري التحقق...")

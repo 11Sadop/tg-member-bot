@@ -537,6 +537,11 @@ async def invite_members(target_group, progress_callback=None, stop_check=None):
             f"❌ المجموع الفاشل: {total_failed}\n"
             f"📱 الحسابات التي شاركت: {active_phones_count}"
         )
+        
+        if progress_queue:
+            alerts = progress_queue[-10:] # get last 10 alerts
+            final_msg += "\n\n🔔 أسباب الفشل/تنبيهات النظام:\n" + "\n".join(alerts)
+
         # Notify about remaining queue elements
         leftover = queue.qsize()
         if leftover > 0:

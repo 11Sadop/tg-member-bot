@@ -306,7 +306,7 @@ async def _invite_worker(phone, phone_idx, target_group, queue, shared_state, st
                 )
                 invite_success = True
 
-            except (UserPrivacyRestrictedError, UserNotMutualContactError):
+            except (UserPrivacyRestrictedError, UserNotMutualContactError) as e_priv:
                 # FALLBACK: Try contact injection ONLY if strictly needed
                 try:
                     await client(ImportContactsRequest([
@@ -324,6 +324,7 @@ async def _invite_worker(phone, phone_idx, target_group, queue, shared_state, st
                     )
                     invite_success = True
                 except Exception as ex_inner:
+                    last_error = ex_inner
                     err_str = str(ex_inner).lower()
                     if "already a participant" in err_str or "user_already_participant" in err_str:
                         invite_success = True
@@ -345,6 +346,7 @@ async def _invite_worker(phone, phone_idx, target_group, queue, shared_state, st
                 break
 
             except Exception as e:
+                last_error = e
                 err_msg = str(e).lower()
                 if "already a participant" in err_msg or "user_already_participant" in err_msg:
                     invite_success = True
@@ -386,11 +388,19 @@ async def _invite_worker(phone, phone_idx, target_group, queue, shared_state, st
                     db.mark_added(uid)
                 queue.task_done()
 
+                # Print the exact error for the first failure to help debug
+                if consecutive_privacy == 1:
+                    try:
+                        err_reason = str(last_error) if 'last_error' in locals() else "Unknown Privacy Error"
+                    except:
+                        err_reason = "Unknown Error"
+                    progress_queue.append(f"🔍 سبب الفشل للأرقام ({phone[-4:]}): {err_reason}")
+
                 # Delay on failure to avoid bot flagging
                 await asyncio.sleep(random.uniform(8, 15))
 
                 if consecutive_privacy >= 10:
-                    progress_queue.append(f"⚠️ {phone}: خصوصية متتالية كثيرة.. سيتم إيقاف هذا الحساب مؤقتاً للحماية.")
+                    progress_queue.append(f"⚠️ {phone}: فشل متتالي لـ 10 أعضاء.. سيتم إيقاف الحساب للحماية.")
                     break
 
         await client.disconnect()

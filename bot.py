@@ -40,6 +40,7 @@ from telethon.errors import SessionPasswordNeededError
 
 import database as db
 import engine
+from proxy_manager import proxy_manager
 
 # ═══════════════════════════════════════════
 # Config
@@ -76,6 +77,7 @@ def main_menu_keyboard():
             InlineKeyboardButton("📊 الحسابات", callback_data="accounts"),
             InlineKeyboardButton("📋 الإحصائيات", callback_data="stats"),
         ],
+        [InlineKeyboardButton("🌐 تحديث البروكسيات المجانية", callback_data="update_proxies")],
         [InlineKeyboardButton("🗑 مسح البيانات", callback_data="clear_menu")],
     ])
 
@@ -209,6 +211,27 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "stats":
         await show_stats(update, context)
 
+    elif data == "update_proxies":
+        if proxy_manager.is_fetching:
+            await query.answer("⏳ جاري تحديث البروكسيات في الخلفية بالفعل...", show_alert=True)
+            return
+            
+        await query.edit_message_text(
+            "⏳ **جاري صيد وفحص البروكسيات المجانية...**\n"
+            "هذه العملية قد تستغرق دقيقة واحدة. الرجاء الانتظار.",
+            parse_mode="Markdown"
+        )
+        
+        success = await proxy_manager.run_update_cycle()
+        count = proxy_manager.get_working_proxies_count()
+        
+        if success:
+            text = f"✅ **تم تحديث البروكسيات بنجاح!**\n\n🌐 البروكسيات الجاهزة: **{count}**\n\nستقوم الحسابات باستخدامها تلقائياً عند النقل لتجنب الحظر."
+        else:
+            text = f"❌ **فشل في جلب بروكسيات جديدة شغال.**\n\n🌐 البروكسيات السابقة المتوفرة: **{count}**"
+            
+        await query.edit_message_text(text, reply_markup=back_keyboard(), parse_mode="Markdown")
+
     elif data == "clear_menu":
         await query.edit_message_text(
             "🗑 **إدارة البيانات**\n\nاختر ما تريد مسحه:",
@@ -305,7 +328,8 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👥 أعضاء محفوظين: {members}\n"
         f"📤 تمت إضافتهم: {added}\n"
         f"📊 متبقي: {max(0, members - added)}\n\n"
-        f"📈 سعة الإضافة: {ready * engine.MAX_PER_ACCOUNT} عضو"
+        f"📈 سعة الإضافة: {ready * engine.MAX_PER_ACCOUNT} عضو\n"
+        f"🌐 بروكسيات مجانية جاهزة: {proxy_manager.get_working_proxies_count()}"
     )
 
     await query.edit_message_text(
@@ -609,15 +633,25 @@ def main():
 
     logger.info("Bot is running!")
 
-    # Python 3.10+ compatibility: ensure event loop exists
+    # Start background proxy updater
+    async def proxy_updater_loop():
+        while True:
+            try:
+                await proxy_manager.run_update_cycle()
+            except Exception as e:
+                logger.error(f"Proxy updater failed: {e}")
+            await asyncio.sleep(7200) # Update every 2 hours
+            
+    # Run the background task without blocking the bot
     import sys
     if sys.version_info >= (3, 10):
-        import asyncio
         try:
-            asyncio.get_running_loop()
+            loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+            
+    loop.create_task(proxy_updater_loop())
 
     app.run_polling(drop_pending_updates=True)
 

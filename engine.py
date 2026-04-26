@@ -25,6 +25,7 @@ from telethon.errors import (
 )
 
 import database as db
+from proxy_manager import proxy_manager
 
 logger = logging.getLogger("engine")
 
@@ -39,9 +40,17 @@ MAX_PER_ACCOUNT = 40  # 40 members per phone number
 def get_client(phone):
     """Create a TelegramClient for the given phone number, using a proxy if available."""
     session_path = os.path.join(db.SESSIONS_DIR, phone)
+    
+    # 1. Check for manual proxy
     proxy = db.get_proxy(phone)
     if proxy:
-        logger.info(f"Using proxy for {phone}")
+        logger.info(f"Using manual proxy for {phone}")
+    else:
+        # 2. Check for auto free proxy
+        proxy = proxy_manager.get_random_proxy()
+        if proxy:
+            logger.info(f"Using auto free proxy for {phone}: {proxy['addr']}:{proxy['port']}")
+            
     return TelegramClient(session_path, API_ID, API_HASH, proxy=proxy)
 
 

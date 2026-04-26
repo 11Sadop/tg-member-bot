@@ -34,22 +34,21 @@ API_HASH = os.environ.get("API_HASH", "9d5791e389f69ed261ee3e40b4b8ddd1")
 MAX_PER_ACCOUNT = 40  # 40 members per phone number
 
 
-# ═══════════════════════════════════════════
-# Session Management
-# ═══════════════════════════════════════════
-def get_client(phone):
+def get_client(phone, use_proxy=True):
     """Create a TelegramClient for the given phone number, using a proxy if available."""
     session_path = os.path.join(db.SESSIONS_DIR, phone)
     
-    # 1. Check for manual proxy
-    proxy = db.get_proxy(phone)
-    if proxy:
-        logger.info(f"Using manual proxy for {phone}")
-    else:
-        # 2. Check for auto free proxy
-        proxy = proxy_manager.get_random_proxy()
+    proxy = None
+    if use_proxy:
+        # 1. Check for manual proxy
+        proxy = db.get_proxy(phone)
         if proxy:
-            logger.info(f"Using auto free proxy for {phone}: {proxy['addr']}:{proxy['port']}")
+            logger.info(f"Using manual proxy for {phone}")
+        else:
+            # 2. Check for auto free proxy
+            proxy = proxy_manager.get_random_proxy()
+            if proxy:
+                logger.info(f"Using auto free proxy for {phone}: {proxy['addr']}:{proxy['port']}")
             
     return TelegramClient(session_path, API_ID, API_HASH, proxy=proxy)
 
@@ -90,7 +89,8 @@ async def scrape_members(phone, source_group, progress_callback=None):
     Scrape members from a group/channel.
     Returns list of member dicts.
     """
-    client = get_client(phone)
+    # Disable proxy for scraping as free proxies are too slow and cause hangs
+    client = get_client(phone, use_proxy=False)
     await client.connect()
 
     if not await client.is_user_authorized():
@@ -168,7 +168,8 @@ async def scrape_active_members(phone, source_group, message_limit=5000, progres
     Scrape members from a group's chat history by collecting users who sent messages.
     Useful for groups with hidden members list.
     """
-    client = get_client(phone)
+    # Disable proxy for scraping
+    client = get_client(phone, use_proxy=False)
     await client.connect()
 
     if not await client.is_user_authorized():

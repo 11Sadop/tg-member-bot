@@ -11,6 +11,22 @@ import os
 import sys
 import asyncio
 import logging
+import socket
+
+# --- DNS PATCH FOR RENDER ---
+def patch_dns():
+    targets = {
+        'api.telegram.org': '149.154.167.220',
+        'production.api.telegram.org': '149.154.166.110'
+    }
+    old_getaddrinfo = socket.getaddrinfo
+    def new_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        if host in targets:
+            return old_getaddrinfo(targets[host], port, family, type, proto, flags)
+        return old_getaddrinfo(host, port, family, type, proto, flags)
+    socket.getaddrinfo = new_getaddrinfo
+patch_dns()
+# ----------------------------
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
@@ -222,11 +238,24 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_keyboard(),
         )
 
+    elif data.startswith("proxy_"):
+        phone = data.replace("proxy_", "")
+        context.user_data["proxy_phone"] = phone
+        await query.edit_message_text(
+            f"🌐 **إعداد البروكسي للرقم {phone}**\n\n"
+            f"أرسل البروكسي بالصيغ التالية:\n"
+            f"`ip:port` (بدون باسورد)\n"
+            f"`ip:port:user:pass` (مع باسورد)\n\n"
+            f"ملاحظة: البوت يدعم SOCKS5 فقط حالياً.",
+            reply_markup=back_keyboard(),
+            parse_mode="Markdown"
+        )
+        context.user_data["state"] = "STATE_PROXY"
+
     elif data.startswith("reset_"):
         phone = data.replace("reset_", "")
         db.reset_flood(phone)
         await show_accounts(update, context)
-
 
 # ═══════════════════════════════════════════
 # Accounts View
@@ -243,13 +272,13 @@ async def show_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buttons = []
         for phone in accounts:
             status = db.get_account_status(phone)
-            lines.append(f"• `{phone}` — {status}")
+            proxy_stat = "✅" if db.get_proxy(phone) else "❌"
+            lines.append(f"• `{phone}` — {status} (بروكسي: {proxy_stat})")
+            
+            row = [InlineKeyboardButton(f"🌐 بروكسي {phone}", callback_data=f"proxy_{phone}")]
             if db.is_flooded(phone):
-                buttons.append([
-                    InlineKeyboardButton(
-                        f"🔓 تصفير {phone}", callback_data=f"reset_{phone}"
-                    )
-                ])
+                row.append(InlineKeyboardButton(f"🔓 تصفير {phone}", callback_data=f"reset_{phone}"))
+            buttons.append(row)
 
         text = "\n".join(lines)
         buttons.append([InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")])
@@ -484,6 +513,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         stop_flags.pop(uid, None)
+
+    # ── Proxy ────────────────────────────────
+    elif state == "STATE_PROXY":
+        phone = context.user_data.get("proxy_phone")
+        if not phone:
+            await update.message.reply_text("❌ حدث خطأ، لم يتم العثور على الرقم.", reply_markup=back_keyboard())
+            context.user_data["state"] = None
+            return
+
+        proxy_str = text.strip()
+        db.save_proxy(phone, proxy_str)
+        
+        await update.message.reply_text(
+            f"✅ تم حفظ البروكسي بنجاح للرقم {phone}\n"
+            f"`{proxy_str}`",
+            reply_markup=back_keyboard(),
+            parse_mode="Markdown"
+        )
+        context.user_data["state"] = None
+        context.user_data.pop("proxy_phone", None)
 
     else:
         await update.message.reply_text(

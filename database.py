@@ -107,3 +107,43 @@ def mark_added(user_id):
 def clear_added():
     if os.path.exists(ADDED_FILE):
         os.remove(ADDED_FILE)
+
+
+# ── Proxy Management ─────────────────────────────
+PROXIES_FILE = os.path.join(DATA_DIR, "proxies.json")
+
+def get_proxies():
+    return load_json(PROXIES_FILE, {})
+
+def save_proxy(phone, proxy_string):
+    """Save a proxy for a specific phone number. Format: ip:port:user:pass or ip:port"""
+    proxies = get_proxies()
+    proxies[phone.replace("+", "")] = proxy_string
+    save_json(PROXIES_FILE, proxies)
+
+def get_proxy(phone):
+    """Retrieve the proxy dictionary for Telethon if it exists."""
+    proxies = get_proxies()
+    proxy_str = proxies.get(phone.replace("+", ""))
+    if not proxy_str:
+        return None
+        
+    parts = proxy_str.split(":")
+    if len(parts) == 2:
+        return {
+            'proxy_type': 'socks5',
+            'addr': parts[0],
+            'port': int(parts[1])
+        }
+    elif len(parts) == 4:
+        return {
+            'proxy_type': 'socks5',
+            'addr': parts[0],
+            'port': int(parts[1]),
+            'username': parts[2],
+            'password': parts[3]
+        }
+    return None
+
+def clear_proxies():
+    save_json(PROXIES_FILE, {})

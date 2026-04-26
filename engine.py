@@ -37,9 +37,12 @@ MAX_PER_ACCOUNT = 40  # 40 members per phone number
 # Session Management
 # ═══════════════════════════════════════════
 def get_client(phone):
-    """Create a TelegramClient for the given phone number."""
+    """Create a TelegramClient for the given phone number, using a proxy if available."""
     session_path = os.path.join(db.SESSIONS_DIR, phone)
-    return TelegramClient(session_path, API_ID, API_HASH)
+    proxy = db.get_proxy(phone)
+    if proxy:
+        logger.info(f"Using proxy for {phone}")
+    return TelegramClient(session_path, API_ID, API_HASH, proxy=proxy)
 
 
 async def register_phone(phone, on_code_needed, on_2fa_needed=None):

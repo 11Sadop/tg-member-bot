@@ -26,6 +26,7 @@ from telethon.errors import (
 
 import database as db
 from proxy_manager import proxy_manager
+import python_socks
 
 logger = logging.getLogger("engine")
 
@@ -371,6 +372,10 @@ async def _invite_worker(phone, phone_idx, target_group, queue, shared_state, st
                     queue.put_nowait((member_idx, member))
                     progress_queue.append(f"🔒 {phone}: انتهت الجلسة (تم تسجيل خروجه).")
                     break
+                elif isinstance(e, (asyncio.TimeoutError, ConnectionError, python_socks.ProxyError)):
+                    queue.put_nowait((member_idx, member))
+                    progress_queue.append(f"🌐 {phone}: البروكسي بطيء أو تعطل! سيتم إيقاف هذا الرقم مؤقتاً لتغيير البروكسي.")
+                    break # Break to disconnect and next time it might pick a new proxy
 
             if invite_success:
                 added += 1

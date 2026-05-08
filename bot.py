@@ -12,6 +12,8 @@ import sys
 import asyncio
 import logging
 import socket
+import zipfile
+import shutil
 
 # --- DNS PATCH FOR RENDER ---
 def patch_dns():
@@ -421,6 +423,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             context.user_data["state"] = None
             context.user_data.pop("reg_client", None)
+            asyncio.create_task(auto_backup(context))
 
         except SessionPasswordNeededError:
             context.user_data["state"] = STATE_2FA
@@ -470,6 +473,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         context.user_data["state"] = None
         context.user_data.pop("reg_client", None)
+        asyncio.create_task(auto_backup(context))
 
     # ── Scrape ───────────────────────────────
     elif state == STATE_SCRAPE_SOURCE:
@@ -504,6 +508,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             final_text += f"\n\n📊 عدد الأعضاء المحفوظين: {len(members)}"
 
         await status_msg.edit_text(final_text, reply_markup=back_keyboard())
+        asyncio.create_task(auto_backup(context))
 
     # ── Invite ───────────────────────────────
     elif state == STATE_INVITE_TARGET:
@@ -594,6 +599,83 @@ async def accounts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════
+# Backup & Restore
+# ═══════════════════════════════════════════
+
+def create_backup_zip():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    zip_path = os.path.join(base_dir, "backup.zip")
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        for folder in ['data', 'sessions']:
+            folder_path = os.path.join(base_dir, folder)
+            if os.path.exists(folder_path):
+                for root, _, files in os.walk(folder_path):
+                    for file in files:
+                        abs_path = os.path.join(root, file)
+                        rel_path = os.path.relpath(abs_path, base_dir)
+                        zipf.write(abs_path, rel_path)
+    return zip_path
+
+async def auto_backup(context):
+    if OWNER_ID == 0: return
+    try:
+        zip_path = create_backup_zip()
+        await context.bot.send_document(
+            chat_id=OWNER_ID,
+            document=open(zip_path, 'rb'),
+            filename="auto_backup.zip",
+            caption="🔄 نسخة احتياطية تلقائية لحماية بياناتك من الحذف."
+        )
+        os.remove(zip_path)
+    except Exception as e:
+        logger.error(f"Auto backup failed: {e}")
+
+async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ هذا الأمر للمشرف فقط.")
+        return
+    await update.message.reply_text("📦 جاري تجهيز النسخة الاحتياطية...")
+    try:
+        zip_path = create_backup_zip()
+        await update.message.reply_document(
+            document=open(zip_path, 'rb'),
+            filename="backup.zip",
+            caption="📦 نسخة احتياطية من الأرقام والأعضاء\n\nلاستعادتها بعد انطفاء السيرفر، قم بالرد على هذا الملف بكلمة `/restore`."
+        )
+        os.remove(zip_path)
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطأ أثناء النسخ الاحتياطي: {e}")
+
+async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ هذا الأمر للمشرف فقط.")
+        return
+    if not update.message.reply_to_message or not update.message.reply_to_message.document:
+        await update.message.reply_text("❌ قم بالرد على ملف النسخة الاحتياطية (backup.zip) بهذا الأمر.")
+        return
+        
+    doc = update.message.reply_to_message.document
+    if not doc.file_name.endswith('.zip'):
+        await update.message.reply_text("❌ الملف يجب أن يكون بصيغة ZIP.")
+        return
+        
+    await update.message.reply_text("📥 جاري استعادة البيانات...")
+    try:
+        file = await context.bot.get_file(doc.file_id)
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        zip_path = os.path.join(base_dir, "restore.zip")
+        await file.download_to_drive(zip_path)
+        
+        with zipfile.ZipFile(zip_path, 'r') as zipf:
+            zipf.extractall(base_dir)
+            
+        os.remove(zip_path)
+        await update.message.reply_text("✅ تم استعادة البيانات (الأرقام والأعضاء) بنجاح! يمكنك الآن تفقد الحسابات.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطأ أثناء الاستعادة: {e}")
+
+
+# ═══════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════
 import threading
@@ -624,6 +706,8 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("accounts", accounts_command))
+    app.add_handler(CommandHandler("backup", backup_command))
+    app.add_handler(CommandHandler("restore", restore_command))
 
     # Callbacks (inline buttons)
     app.add_handler(CallbackQueryHandler(button_callback))

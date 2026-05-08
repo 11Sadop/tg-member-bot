@@ -374,8 +374,19 @@ async def _invite_worker(phone, phone_idx, target_group, queue, shared_state, st
                     break
                 elif isinstance(e, (asyncio.TimeoutError, ConnectionError, python_socks.ProxyError)):
                     queue.put_nowait((member_idx, member))
-                    progress_queue.append(f"🌐 {phone}: البروكسي بطيء أو تعطل! سيتم إيقاف هذا الرقم مؤقتاً لتغيير البروكسي.")
-                    break # Break to disconnect and next time it might pick a new proxy
+                    progress_queue.append(f"🌐 {phone}: البروكسي انقطع! جاري التبديل لبروكسي آخر...")
+                    try:
+                        await client.disconnect()
+                    except: pass
+                    
+                    # Force fetch a new client (which grabs a new free proxy if manual is not set)
+                    client = get_client(phone)
+                    try:
+                        await client.connect()
+                    except:
+                        progress_queue.append(f"❌ {phone}: فشل الاتصال بالبروكسي الجديد.")
+                        break
+                    continue # Continue the while loop with the new client
 
             if invite_success:
                 added += 1

@@ -41,15 +41,10 @@ def get_client(phone, use_proxy=True):
     
     proxy = None
     if use_proxy:
-        # 1. Check for manual proxy
+        # Only use MANUAL proxy set by user. Free proxies are too unreliable.
         proxy = db.get_proxy(phone)
         if proxy:
             logger.info(f"Using manual proxy for {phone}")
-        else:
-            # 2. Check for auto free proxy
-            proxy = proxy_manager.get_random_proxy()
-            if proxy:
-                logger.info(f"Using auto free proxy for {phone}: {proxy['addr']}:{proxy['port']}")
             
     return TelegramClient(session_path, API_ID, API_HASH, proxy=proxy)
 
@@ -60,7 +55,7 @@ async def register_phone(phone, on_code_needed, on_2fa_needed=None):
     on_code_needed: async callback that returns the verification code.
     on_2fa_needed: async callback that returns the 2FA password.
     """
-    client = get_client(phone)
+    client = get_client(phone, use_proxy=False)
     await client.connect()
 
     if await client.is_user_authorized():
@@ -237,9 +232,11 @@ async def _invite_worker(phone, phone_idx, target_group, queue, shared_state, st
     added = 0
     failed = 0
     client = get_client(phone)
+    proxy_retries = 0
+    MAX_PROXY_RETRIES = 3
 
     try:
-        await client.connect()
+        await asyncio.wait_for(client.connect(), timeout=15.0)
         if not await client.is_user_authorized():
             progress_queue.append(f"⚠️ {phone} غير مسجل.. تم تخطيه.")
             return 0, 0
@@ -257,16 +254,14 @@ async def _invite_worker(phone, phone_idx, target_group, queue, shared_state, st
             await client.disconnect()
             return 0, 0
 
-        is_channel = getattr(target_entity, 'broadcast', False)
-        
-        # Initial Human Warmup
+        # Small warmup
         try:
-            await client.get_messages(target_entity, limit=5)
-            await asyncio.sleep(random.uniform(3, 8))
+            await client.get_messages(target_entity, limit=3)
+            await asyncio.sleep(random.uniform(2, 4))
         except Exception:
             pass
 
-        consecutive_privacy = 0
+        consecutive_fails = 0
 
         while added < MAX_PER_ACCOUNT:
             if stop_check and stop_check():
@@ -275,18 +270,17 @@ async def _invite_worker(phone, phone_idx, target_group, queue, shared_state, st
             try:
                 member_idx, member = queue.get_nowait()
             except asyncio.QueueEmpty:
-                break # No more members to process
+                break
 
             username = member.get("username", "")
             user_id = member.get("id")
             access_hash = member.get("access_hash", "0")
-            display = f"@{username}" if username else f"ID:{user_id}"
 
             # Resolve user entity
             user_entity = None
             if username and username != "None":
                 try:
-                    user_entity = await asyncio.wait_for(client.get_entity(username), timeout=5.0)
+                    user_entity = await asyncio.wait_for(client.get_entity(username), timeout=8.0)
                 except Exception:
                     pass
 
@@ -297,7 +291,7 @@ async def _invite_worker(phone, phone_idx, target_group, queue, shared_state, st
                         user_entity = InputPeerUser(int(user_id), uhash)
                     else:
                         try:
-                            user_entity = await asyncio.wait_for(client.get_entity(int(user_id)), timeout=5.0)
+                            user_entity = await asyncio.wait_for(client.get_entity(int(user_id)), timeout=8.0)
                         except Exception:
                             pass
                 except (ValueError, TypeError):
@@ -307,56 +301,34 @@ async def _invite_worker(phone, phone_idx, target_group, queue, shared_state, st
                 failed += 1
                 shared_state['failed'] += 1
                 queue.task_done()
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
                 continue
 
             invite_success = False
 
-            # SAFE ATTEMPT: Direct invite without contact injection
             try:
                 await asyncio.wait_for(
                     client(InviteToChannelRequest(target_entity, [user_entity])),
-                    timeout=30.0
+                    timeout=20.0
                 )
                 invite_success = True
+                proxy_retries = 0  # Reset on success
 
-            except (UserPrivacyRestrictedError, UserNotMutualContactError) as e_priv:
-                # FALLBACK: Try contact injection ONLY if strictly needed
-                try:
-                    await client(ImportContactsRequest([
-                        InputPhoneContact(
-                            client_id=random.randint(0, 999999),
-                            phone="", first_name=display, last_name=""
-                        )
-                    ]))
-                    await asyncio.sleep(random.uniform(2, 4)) # Small delay after import
-                    
-                    # Retry invite
-                    await asyncio.wait_for(
-                        client(InviteToChannelRequest(target_entity, [user_entity])),
-                        timeout=30.0
-                    )
-                    invite_success = True
-                except Exception as ex_inner:
-                    last_error = ex_inner
-                    err_str = str(ex_inner).lower()
-                    if "already a participant" in err_str or "user_already_participant" in err_str:
-                        invite_success = True
-                    else:
-                        pass # Kept as failed
+            except (UserPrivacyRestrictedError, UserNotMutualContactError):
+                pass  # Can't add this user, count as failed
 
             except FloodWaitError as e:
                 db.set_flood(phone, e.seconds)
-                queue.put_nowait((member_idx, member)) # Put member back!
-                progress_queue.append(f"🚫 {phone}: انحظر مؤقتاً (فلود الطير).")
+                queue.put_nowait((member_idx, member))
+                progress_queue.append(f"🚫 {phone}: فلود! انتظار {e.seconds} ثانية.")
                 break
 
             except (PeerFloodError, ChatWriteForbiddenError, UserBannedInChannelError) as e:
-                queue.put_nowait((member_idx, member)) # Put member back!
+                queue.put_nowait((member_idx, member))
                 if isinstance(e, ChatWriteForbiddenError):
-                    progress_queue.append(f"❌ {phone}: ليس لديه صلاحية للإضافة في هذه المجموعة.")
+                    progress_queue.append(f"❌ {phone}: ليس لديه صلاحية للإضافة.")
                 else:
-                    progress_queue.append(f"🚫 {phone}: وصل حد الإزعاج المستمر (حظر سبام). تم حماية الأرقام الأخرى.")
+                    progress_queue.append(f"🚫 {phone}: حظر سبام! تم إيقاف الرقم للحماية.")
                 break
 
             except Exception as e:
@@ -366,82 +338,84 @@ async def _invite_worker(phone, phone_idx, target_group, queue, shared_state, st
                     invite_success = True
                 elif "chatadminrequired" in err_msg:
                     queue.put_nowait((member_idx, member))
-                    progress_queue.append(f"❌ {phone}: لا يمكن الإضافة! تحتاج أن تكون مشرفاً (Admin) في هذه القناة.")
+                    progress_queue.append(f"❌ {phone}: تحتاج أن تكون مشرفاً (Admin).")
                     break
                 elif "authkey" in err_msg or "unauthorized" in err_msg:
                     queue.put_nowait((member_idx, member))
-                    progress_queue.append(f"🔒 {phone}: انتهت الجلسة (تم تسجيل خروجه).")
+                    progress_queue.append(f"🔒 {phone}: انتهت الجلسة.")
                     break
-                elif isinstance(e, (asyncio.TimeoutError, ConnectionError, python_socks.ProxyError)):
+                elif isinstance(e, (asyncio.TimeoutError, ConnectionError, OSError)):
                     queue.put_nowait((member_idx, member))
-                    progress_queue.append(f"🌐 {phone}: البروكسي انقطع! جاري التبديل لبروكسي آخر...")
+                    proxy_retries += 1
+                    if proxy_retries >= MAX_PROXY_RETRIES:
+                        progress_queue.append(f"🌐 {phone}: انقطاع متكرر ({proxy_retries}x). إيقاف.")
+                        break
+                    progress_queue.append(f"🌐 {phone}: انقطاع اتصال، محاولة إعادة الاتصال...")
                     try:
                         await client.disconnect()
                     except: pass
-                    
-                    # Force fetch a new client (which grabs a new free proxy if manual is not set)
-                    client = get_client(phone)
+                    await asyncio.sleep(3)
                     try:
-                        await client.connect()
+                        client = get_client(phone)
+                        await asyncio.wait_for(client.connect(), timeout=15.0)
+                        target_entity = await asyncio.wait_for(client.get_entity(target_group), timeout=15.0)
                     except:
-                        progress_queue.append(f"❌ {phone}: فشل الاتصال بالبروكسي الجديد.")
+                        progress_queue.append(f"❌ {phone}: فشل إعادة الاتصال.")
                         break
-                    continue # Continue the while loop with the new client
+                    continue
 
             if invite_success:
                 added += 1
                 shared_state['added'] += 1
-                consecutive_privacy = 0
+                consecutive_fails = 0
 
                 uid = str(getattr(user_entity, 'user_id', getattr(user_entity, 'id', user_id)))
                 db.mark_added(uid)
                 queue.task_done()
 
-                # SMART DELAY ON SUCCESS
+                # Delay between successful adds (15-25 seconds - fast but safe)
                 if added < MAX_PER_ACCOUNT:
-                    # Every 5 adds, read history to simulate real human browsing
-                    if added % 5 == 0:
+                    if added % 10 == 0:
+                        # Every 10 adds, take a slightly longer break
                         try:
-                            await client.get_messages(target_entity, limit=5)
-                            await asyncio.sleep(random.uniform(5, 10))
+                            await client.get_messages(target_entity, limit=3)
                         except: pass
-                        
-                    delay = random.uniform(30, 55) # Long delay to prevent fast PeerFlood
-                    await asyncio.sleep(delay)
+                        await asyncio.sleep(random.uniform(8, 15))
+                    else:
+                        await asyncio.sleep(random.uniform(15, 25))
             else:
                 failed += 1
                 shared_state['failed'] += 1
-                consecutive_privacy += 1
+                consecutive_fails += 1
                 uid = str(user_id or "")
                 if uid:
                     db.mark_added(uid)
                 queue.task_done()
 
-                # Print the exact error for the first failure to help debug
-                if consecutive_privacy == 1:
+                if consecutive_fails == 1:
                     try:
-                        err_reason = str(last_error) if 'last_error' in locals() else "Unknown Privacy Error"
+                        err_reason = str(last_error) if 'last_error' in locals() else "خصوصية"
                     except:
-                        err_reason = "Unknown Error"
-                    progress_queue.append(f"🔍 سبب الفشل للأرقام ({phone[-4:]}): {err_reason}")
+                        err_reason = "غير معروف"
+                    progress_queue.append(f"🔍 سبب فشل ({phone[-4:]}): {err_reason}")
 
-                # Delay on failure to avoid bot flagging
-                await asyncio.sleep(random.uniform(8, 15))
+                await asyncio.sleep(random.uniform(3, 6))
 
-                if consecutive_privacy >= 25:
-                    progress_queue.append(f"⚠️ {phone}: فشل متتالي لـ 25 عضو.. سيتم إيقاف الحساب للحماية.")
+                if consecutive_fails >= 25:
+                    progress_queue.append(f"⚠️ {phone}: فشل متتالي 25 مرة. إيقاف.")
                     break
 
         await client.disconnect()
 
     except Exception as e:
-        progress_queue.append(f"⚠️ {phone}: تعطل مفاجئ - {str(e)[:40]}")
+        progress_queue.append(f"⚠️ {phone}: تعطل - {str(e)[:50]}")
         try:
             await client.disconnect()
         except:
             pass
 
     return added, failed
+
 
 
 async def invite_members(target_group, progress_callback=None, stop_check=None):

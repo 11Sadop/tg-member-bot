@@ -694,7 +694,7 @@ def start_dummy_server():
     server.serve_forever()
 
 def main():
-    logger.info("Starting TG Member Bot v1.0...")
+    logger.info("Starting TG Member Bot v2.0...")
 
     # Start dummy web server so Render doesn't timeout the "Web Service" Deploy
     threading.Thread(target=start_dummy_server, daemon=True).start()
@@ -715,28 +715,19 @@ def main():
     # Text messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Bot is running!")
+    # Background proxy updater - uses post_init to avoid asyncio loop crash
+    async def post_init(application):
+        async def proxy_updater_loop():
+            while True:
+                try:
+                    await proxy_manager.run_update_cycle()
+                except Exception as e:
+                    logger.error(f"Proxy updater failed: {e}")
+                await asyncio.sleep(7200)
+        asyncio.create_task(proxy_updater_loop())
+        logger.info("Bot is running! Background proxy updater started.")
 
-    # Start background proxy updater
-    async def proxy_updater_loop():
-        while True:
-            try:
-                await proxy_manager.run_update_cycle()
-            except Exception as e:
-                logger.error(f"Proxy updater failed: {e}")
-            await asyncio.sleep(7200) # Update every 2 hours
-            
-    # Run the background task without blocking the bot
-    import sys
-    if sys.version_info >= (3, 10):
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-    loop.create_task(proxy_updater_loop())
-
+    app.post_init = post_init
     app.run_polling(drop_pending_updates=True)
 
 

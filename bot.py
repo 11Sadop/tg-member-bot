@@ -360,9 +360,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             client = engine.get_client(phone.replace("+", ""), use_proxy=True)
-            await asyncio.wait_for(client.connect(), timeout=20.0)
+            await asyncio.wait_for(client.connect(), timeout=15.0)
 
-            if await client.is_user_authorized():
+            if await asyncio.wait_for(client.is_user_authorized(), timeout=10.0):
                 await client.disconnect()
                 await status_msg.edit_text(
                     f"✅ الرقم {phone} مسجل بالفعل!",
@@ -371,7 +371,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["state"] = None
                 return
 
-            await client.send_code_request(phone)
+            await asyncio.wait_for(client.send_code_request(phone), timeout=15.0)
             context.user_data["reg_client"] = client
 
             await status_msg.edit_text(
@@ -410,8 +410,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_msg = await update.message.reply_text("🔐 جاري التحقق...")
 
         try:
-            await client.sign_in(phone, code)
-            me = await client.get_me()
+            await asyncio.wait_for(client.sign_in(phone, code), timeout=15.0)
+            me = await asyncio.wait_for(client.get_me(), timeout=10.0)
             await client.disconnect()
 
             await status_msg.edit_text(
@@ -453,8 +453,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_msg = await update.message.reply_text("🔐 جاري التحقق من كلمة المرور...")
 
         try:
-            await client.sign_in(password=password)
-            me = await client.get_me()
+            await asyncio.wait_for(client.sign_in(password=password), timeout=15.0)
+            me = await asyncio.wait_for(client.get_me(), timeout=10.0)
             await client.disconnect()
 
             await status_msg.edit_text(

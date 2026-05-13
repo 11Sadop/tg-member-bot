@@ -359,8 +359,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_msg = await update.message.reply_text(f"📲 جاري إرسال الكود إلى {phone}...")
 
         try:
-            client = engine.get_client(phone.replace("+", ""))
-            await client.connect()
+            client = engine.get_client(phone.replace("+", ""), use_proxy=True)
+            await asyncio.wait_for(client.connect(), timeout=20.0)
 
             if await client.is_user_authorized():
                 await client.disconnect()

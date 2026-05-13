@@ -41,12 +41,18 @@ def get_client(phone, use_proxy=True):
     
     proxy = None
     if use_proxy:
-        # Only use MANUAL proxy set by user. Free proxies are too unreliable.
+        # 1. Check for manual proxy
         proxy = db.get_proxy(phone)
         if proxy:
             logger.info(f"Using manual proxy for {phone}")
+        else:
+            # 2. Auto free proxy (needed because Render blocks direct Telegram DC connections)
+            proxy = proxy_manager.get_random_proxy()
+            if proxy:
+                logger.info(f"Using auto free proxy for {phone}: {proxy['addr']}:{proxy['port']}")
             
-    return TelegramClient(session_path, API_ID, API_HASH, proxy=proxy)
+    return TelegramClient(session_path, API_ID, API_HASH, proxy=proxy,
+                          timeout=15, connection_retries=3, retry_delay=2)
 
 
 async def register_phone(phone, on_code_needed, on_2fa_needed=None):
@@ -233,10 +239,28 @@ async def _invite_worker(phone, phone_idx, target_group, queue, shared_state, st
     failed = 0
     client = get_client(phone)
     proxy_retries = 0
-    MAX_PROXY_RETRIES = 3
+    MAX_PROXY_RETRIES = 5
 
     try:
-        await asyncio.wait_for(client.connect(), timeout=15.0)
+        try:
+            await asyncio.wait_for(client.connect(), timeout=15.0)
+        except Exception as conn_err:
+            # First connection failed, try with different proxies
+            for retry in range(MAX_PROXY_RETRIES):
+                progress_queue.append(f"🌐 {phone}: فشل الاتصال، محاولة بروكسي آخر ({retry+1}/{MAX_PROXY_RETRIES})...")
+                try:
+                    await client.disconnect()
+                except: pass
+                await asyncio.sleep(1)
+                client = get_client(phone)
+                try:
+                    await asyncio.wait_for(client.connect(), timeout=12.0)
+                    break
+                except:
+                    continue
+            else:
+                progress_queue.append(f"❌ {phone}: فشل الاتصال بجميع البروكسيات.")
+                return 0, 0
         if not await client.is_user_authorized():
             progress_queue.append(f"⚠️ {phone} غير مسجل.. تم تخطيه.")
             return 0, 0

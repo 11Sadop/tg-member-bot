@@ -15,18 +15,26 @@ import socket
 import zipfile
 import shutil
 
-# --- DNS PATCH FOR RENDER ---
+# --- DNS PATCH (fixes broken local DNS) ---
+import subprocess
+
 def patch_dns():
-    targets = {
+    """Resolve Telegram API via Google DNS when local DNS fails."""
+    import struct
+    
+    # Direct IP mappings for Telegram API
+    telegram_ips = {
         'api.telegram.org': '149.154.167.220',
-        'production.api.telegram.org': '149.154.166.110'
     }
+    
     old_getaddrinfo = socket.getaddrinfo
     def new_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-        if host in targets:
-            return old_getaddrinfo(targets[host], port, family, type, proto, flags)
+        if host in telegram_ips:
+            ip = telegram_ips[host]
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (ip, port))]
         return old_getaddrinfo(host, port, family, type, proto, flags)
     socket.getaddrinfo = new_getaddrinfo
+
 patch_dns()
 # ----------------------------
 
@@ -44,11 +52,15 @@ import database as db
 import engine
 from proxy_manager import proxy_manager
 
-# ═══════════════════════════════════════════
-# Config
-# ═══════════════════════════════════════════
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8543632979:AAFi16sozf4xqyzfElAXKulSEOcWVp_xaU0")
-OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8543632979:AAEAt6lzaqdvDt8xEvSDGE-cl_tWMuE5K88").strip()
+OWNER_ID = int(os.environ.get("OWNER_ID", "6733973427").strip() or "6733973427")
+
 
 logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -700,7 +712,11 @@ def main():
     threading.Thread(target=start_dummy_server, daemon=True).start()
     logger.info("Started dummy web server for Render health checks.")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    proxy_url = os.environ.get("PROXY_URL")
+    builder = Application.builder().token(BOT_TOKEN)
+    if proxy_url:
+        builder = builder.proxy_url(proxy_url).get_updates_proxy_url(proxy_url)
+    app = builder.build()
 
     # Commands
     app.add_handler(CommandHandler("start", start_command))
